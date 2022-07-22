@@ -1,3 +1,7 @@
+/**
+ *Submitted for verification at Arbiscan on 2021-11-19
+*/
+
 // SPDX-License-Identifier: MIT
 
 pragma solidity ^0.8.0;
@@ -84,7 +88,6 @@ interface IERC20 {
      */
     event Approval(address indexed owner, address indexed spender, uint256 value);
 }
-
 /**
  * @dev Collection of functions related to the address type
  */
@@ -417,36 +420,61 @@ interface IRouter {
 
     function getCapRewards(address currency) external view returns (address);
 }
-interface IRewards {
-    function updateRewards(address account) external;
+interface ITrading {
 
-    function notifyRewardReceived(uint256 amount) external;
+    function distributeFees(address currency) external;
+    
+    function settleOrder(address user, bytes32 productId, address currency, bool isLong, uint256 price) external;
+
+    function liquidatePosition(address user, bytes32 productId, address currency, bool isLong, uint256 price) external;
+
+    function getPendingFee(address currency) external view returns(uint256);
+    
 }
-contract PoolCAP {
+interface IPool {
+    function totalSupply() external view returns (uint256);
+
+    function creditUserProfit(address destination, uint256 amount) external;
+    
+    function updateOpenInterest(uint256 amount, bool isDecrease) external;
+
+    function getUtilization() external view returns (uint256);
+
+    function getBalance(address account) external view returns (uint256);
+
+}
+contract Rewards {
 
 	using SafeERC20 for IERC20; 
+    using Address for address payable;
 
-	address public owner;
+    address public owner;
 	address public router;
+	address public trading;
+	address public treasury;
 
-	address public cap; // CAP address
+	address public pool; // pool contract associated with these rewards
+	address public currency; // rewards paid in this
 
-	mapping(address => uint256) private balances; // account => amount staked
-	uint256 public totalSupply;
+	uint256 public cumulativeRewardPerTokenStored;
+	uint256 public pendingReward;
 
-	// Events
-    event DepositCAP(
-    	address indexed user, 
-    	uint256 amount
-    );
-    event WithdrawCAP(
-    	address indexed user,
-    	uint256 amount
-    );
+	mapping(address => uint256) private claimableReward;
+	mapping(address => uint256) private previousRewardPerToken;
 
-	constructor(address _cap) {
+	uint256 public constant UNIT = 10**18;
+
+	event CollectedReward(
+		address user,
+		address poolContract,
+		address currency,
+		uint256 amount
+	);
+
+	constructor(address _pool, address _currency) {
 		owner = msg.sender;
-		cap = _cap;
+		pool = _pool;
+		currency = _currency;
 	}
 
 	// Governance methods
@@ -457,63 +485,110 @@ contract PoolCAP {
 
 	function setRouter(address _router) external onlyOwner {
 		router = _router;
+		trading = IRouter(router).trading();
+		treasury = IRouter(router).treasury();
 	}
 
-	function deposit(uint256 amount) external {
+	// Methods
 
-		require(amount > 0, "!amount");
-
-		_updateRewards();
-
-		totalSupply += amount;
-		balances[msg.sender] += amount;
-
-		IERC20(cap).safeTransferFrom(msg.sender, address(this), amount);
-
-		emit DepositCAP(
-			msg.sender,
-			amount
-		);
-
+	function notifyRewardReceived(uint256 amount) external onlyTreasuryOrPool {
+		pendingReward += amount; // 18 decimals
 	}
 
-	function withdraw(uint256 amount) external {
-		
-		require(amount > 0, "!amount");
+	function updateRewards(address account) public {
 
-		if (amount >= balances[msg.sender]) {
-			amount = balances[msg.sender];
+		if (account == address(0)) return;
+
+		ITrading(trading).distributeFees(currency);
+
+		uint256 supply = IPool(pool).totalSupply();
+
+		if (supply > 0) {
+			cumulativeRewardPerTokenStored += pendingReward * UNIT / supply;
+			pendingReward = 0;
 		}
 
-		_updateRewards();
+		if (cumulativeRewardPerTokenStored == 0) return; // no rewards yet
 
-		totalSupply -= amount;
-		balances[msg.sender] -= amount;
+		uint256 accountBalance = IPool(pool).getBalance(account); // in CLP
 
-		IERC20(cap).safeTransfer(msg.sender, amount);
-
-		emit WithdrawCAP(
-			msg.sender,
-			amount
-		);
+		claimableReward[account] += accountBalance * (cumulativeRewardPerTokenStored - previousRewardPerToken[account]) / UNIT;
+		previousRewardPerToken[account] = cumulativeRewardPerTokenStored;
 
 	}
 
-	function getBalance(address account) external view returns(uint256) {
-		return balances[account];
+	function collectReward() external {
+
+		updateRewards(msg.sender);
+
+		uint256 rewardToSend = claimableReward[msg.sender];
+		claimableReward[msg.sender] = 0;
+
+		if (rewardToSend > 0) {
+
+			_transferOut(msg.sender, rewardToSend);
+
+			emit CollectedReward(
+				msg.sender, 
+				pool, 
+				currency, 
+				rewardToSend
+			);
+
+		}
+
 	}
 
-	function _updateRewards() internal {
-		uint256 length = IRouter(router).currenciesLength();
-		for (uint256 i = 0; i < length; i++) {
-			address currency = IRouter(router).currencies(i);
-			address rewardsContract = IRouter(router).getCapRewards(currency);
-			IRewards(rewardsContract).updateRewards(msg.sender);
+	function getClaimableReward() external view returns(uint256) {
+
+		uint256 currentClaimableReward = claimableReward[msg.sender];
+
+		uint256 supply = IPool(pool).totalSupply();
+		if (supply == 0) return currentClaimableReward;
+
+		uint256 share;
+		if (pool == IRouter(router).capPool()) {
+			share = IRouter(router).getCapShare(currency);
+		} else {
+			share = IRouter(router).getPoolShare(currency);
+		}
+
+		uint256 _pendingReward = pendingReward + ITrading(trading).getPendingFee(currency) * share / 10**4;
+
+		uint256 _rewardPerTokenStored = cumulativeRewardPerTokenStored + _pendingReward * UNIT / supply;
+		if (_rewardPerTokenStored == 0) return currentClaimableReward; // no rewards yet
+
+		uint256 accountStakedBalance = IPool(pool).getBalance(msg.sender);
+
+		return currentClaimableReward + accountStakedBalance * (_rewardPerTokenStored - previousRewardPerToken[msg.sender]) / UNIT;
+		
+	}
+
+	// To receive ETH
+	fallback() external payable {}
+	receive() external payable {}
+
+	// Utils
+
+	function _transferOut(address to, uint256 amount) internal {
+		if (amount == 0 || to == address(0)) return;
+		// adjust decimals
+		uint256 decimals = IRouter(router).getDecimals(currency);
+		amount = amount * (10**decimals) / UNIT;
+		if (currency == address(0)) {
+			payable(to).sendValue(amount);
+		} else {
+			IERC20(currency).safeTransfer(to, amount);
 		}
 	}
 
 	modifier onlyOwner() {
 		require(msg.sender == owner, "!owner");
+		_;
+	}
+
+	modifier onlyTreasuryOrPool() {
+		require(msg.sender == treasury || msg.sender == pool, "!treasury|pool");
 		_;
 	}
 
